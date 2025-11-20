@@ -3,6 +3,7 @@ package query
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10,10 +11,9 @@ import (
 	gossipv1 "github.com/certusone/wormhole/node/pkg/proto/gossip/v1"
 	"github.com/certusone/wormhole/node/pkg/query/queryratelimit"
 	"github.com/certusone/wormhole/node/pkg/supervisor"
-	"github.com/wormhole-foundation/wormhole/sdk/vaa"
-
 	ethCommon "github.com/ethereum/go-ethereum/common"
 	ethCrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/wormhole-foundation/wormhole/sdk/vaa"
 
 	"go.uber.org/zap"
 )
@@ -61,6 +61,67 @@ func NewQueryHandler(
 		queryResponseReadC:  queryResponseReadC,
 		queryResponseWriteC: queryResponseWriteC,
 	}
+}
+
+// recoverQueryRequestSigner recovers the Ethereum address from a Wormhole Query signature.
+// It supports:
+//   - Raw 65-byte ECDSA signatures (old behaviour, CLI, Frame, etc.)
+//   - Ethereum-prefixed signatures from personal_sign / eth_signTypedData (MetaMask, Rabby, etc.)
+func recoverQueryRequestSigner(digest, signature []byte) (ethCommon.Address, error) {
+	if len(signature) != 65 {
+		return ethCommon.Address{}, fmt.Errorf("signature must be 65 bytes, got %d", len(signature))
+	}
+
+	// Copy the signature because some libraries modify it in-place
+	sig := make([]byte, len(signature))
+	copy(sig, signature)
+
+	// v is the recovery byte (0,1,27,28 on Ethereum). Normalise to 0/1 because go-ethereum's Ecrecover expects that.
+	if sig[64] >= 27 {
+		sig[64] -= 27
+	}
+
+	// 1. Try raw signature (original Wormhole Queries behaviour - for CLI/SDK clients)
+	rawPubkey, rawErr := ethCrypto.Ecrecover(digest, sig)
+	var rawAddress ethCommon.Address
+	if rawErr == nil {
+		rawAddress = ethCommon.BytesToAddress(ethCrypto.Keccak256(rawPubkey[1:])[12:])
+	}
+
+	// 2. Try Ethereum prefixed message ("\x19Ethereum Signed Message:\n32" + digest)
+	// This is what personal_sign and most wallets return (MetaMask, Rabby, etc.)
+	prefixedMsg := append([]byte("\x19Ethereum Signed Message:\n32"), digest...)
+	prefixedHash := ethCrypto.Keccak256Hash(prefixedMsg)
+
+	prefixedPubkey, prefixedErr := ethCrypto.Ecrecover(prefixedHash.Bytes(), sig)
+	var prefixedAddress ethCommon.Address
+	if prefixedErr == nil {
+		prefixedAddress = ethCommon.BytesToAddress(ethCrypto.Keccak256(prefixedPubkey[1:])[12:])
+	}
+
+	// If only raw succeeded, use raw
+	if rawErr == nil && prefixedErr != nil {
+		return rawAddress, nil
+	}
+
+	// If only prefixed succeeded, use prefixed
+	if rawErr != nil && prefixedErr == nil {
+		return prefixedAddress, nil
+	}
+
+	// If both succeeded but give the same address, return it
+	if rawErr == nil && prefixedErr == nil && rawAddress == prefixedAddress {
+		return rawAddress, nil
+	}
+
+	// If both succeeded but give different addresses, this is ambiguous
+	// The signature matches multiple possible signers depending on how it was created
+	// For now, prefer raw for backward compatibility, but log a warning
+	if rawErr == nil && prefixedErr == nil && rawAddress != prefixedAddress {
+		return rawAddress, fmt.Errorf("ambiguous signature: raw recovery=%s, prefixed recovery=%s", rawAddress.Hex(), prefixedAddress.Hex())
+	}
+
+	return ethCommon.Address{}, errors.New("signature invalid: recovery failed for both raw and prefixed message")
 }
 
 type (
@@ -229,31 +290,28 @@ func handleQueryRequestsImpl(
 			return nil
 
 		case signedRequest := <-signedQueryReqC: // Inbound query request.
-			// requestor validation happens here
-			// request type validation is currently handled by the watcher
-			// in the future, it may be worthwhile to catch certain types of
-			// invalid requests here for tracking purposes
-			// e.g.
-			// - length check on "signature" 65 bytes
-			// - length check on "to" address 20 bytes
-			// - valid "block" strings
-
 			allQueryRequestsReceived.Inc()
-			digest := QueryRequestDigest(env, signedRequest.QueryRequest)
 
-			// It's possible that the signature alone is not unique, and the digest alone is not unique, but the combination should be.
+			digest := QueryRequestDigest(env, signedRequest.QueryRequest)
 			requestID := hex.EncodeToString(signedRequest.Signature) + ":" + digest.String()
 
 			qLogger.Info("received a query request", zap.String("requestID", requestID))
 
-			signerBytes, err := ethCrypto.Ecrecover(digest.Bytes(), signedRequest.Signature)
+			// NEW: supports both raw signatures (old clients) and prefixed personal_sign / signTypedData (MetaMask, etc.)
+			signerAddress, err := recoverQueryRequestSigner(digest.Bytes(), signedRequest.Signature)
 			if err != nil {
-				qLogger.Error("failed to recover public key", zap.String("requestID", requestID))
-				invalidQueryRequestReceived.WithLabelValues("failed_to_recover_public_key").Inc()
+				qLogger.Error("failed to recover signer",
+					zap.String("requestID", requestID),
+					zap.Error(err),
+				)
+				invalidQueryRequestReceived.WithLabelValues("failed_to_recover_signer").Inc()
 				continue
 			}
 
-			signerAddress := ethCommon.BytesToAddress(ethCrypto.Keccak256(signerBytes[1:])[12:])
+			qLogger.Info("signer recovered",
+				zap.String("requestID", requestID),
+				zap.String("signer", signerAddress.Hex()),
+			)
 
 			// get a rate limit policy for this requestor
 			// if they dont have one, they will receive one with no networks, and so will fail any reasonable enforcement action

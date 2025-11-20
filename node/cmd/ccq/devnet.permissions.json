@@ -2,6 +2,11 @@
   "allowAnythingSupported": true,
   "permissions": [
     {
+      "userName": "Staking Based User",
+      "apiKey": "",
+      "allowAnything": true
+    },
+    {
       "userName": "Test User",
       "apiKey": "my_secret_key",
       "allowedCalls": [

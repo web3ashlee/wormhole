@@ -86,9 +86,14 @@ spec:
                 sleep 1
               done
 
+              # Additional wait to ensure daemon fully releases locks
+              echo "Waiting for IPFS daemon to fully initialize..."
+              sleep 3
+
               # Add JSON data to IPFS and capture CID
               echo "Adding ccq-rate-limits.json to IPFS..."
-              CID=$(ipfs add -Q /data-to-add/ccq-rate-limits.json)
+              # Use cat to pipe content directly, avoiding directory structure
+              CID=$(cat /data-to-add/ccq-rate-limits.json | ipfs add -Q)
               echo "=========================================="
               echo "CCQ Rate Limits CID: $CID"
               echo "=========================================="
