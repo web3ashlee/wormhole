@@ -3,7 +3,6 @@ package query
 import (
 	"context"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"time"
 
@@ -64,9 +63,7 @@ func NewQueryHandler(
 }
 
 // recoverQueryRequestSigner recovers the Ethereum address from a Wormhole Query signature.
-// It supports:
-//   - Raw 65-byte ECDSA signatures (old behaviour, CLI, Frame, etc.)
-//   - Ethereum-prefixed signatures from personal_sign / eth_signTypedData (MetaMask, Rabby, etc.)
+// It tries both Ethereum-prefixed personal_sign signatures (browser wallets) and raw ECDSA signatures (CLI/SDK).
 func recoverQueryRequestSigner(digest, signature []byte) (ethCommon.Address, error) {
 	if len(signature) != 65 {
 		return ethCommon.Address{}, fmt.Errorf("signature must be 65 bytes, got %d", len(signature))
@@ -81,47 +78,28 @@ func recoverQueryRequestSigner(digest, signature []byte) (ethCommon.Address, err
 		sig[64] -= 27
 	}
 
-	// 1. Try raw signature (original Wormhole Queries behaviour - for CLI/SDK clients)
-	rawPubkey, rawErr := ethCrypto.Ecrecover(digest, sig)
-	var rawAddress ethCommon.Address
-	if rawErr == nil {
-		rawAddress = ethCommon.BytesToAddress(ethCrypto.Keccak256(rawPubkey[1:])[12:])
-	}
-
-	// 2. Try Ethereum prefixed message ("\x19Ethereum Signed Message:\n32" + digest)
-	// This is what personal_sign and most wallets return (MetaMask, Rabby, etc.)
-	prefixedMsg := append([]byte("\x19Ethereum Signed Message:\n32"), digest...)
+	// 1. Try with Ethereum personal_sign prefix FIRST (for browser wallet signatures)
+	// Format: "\x19Ethereum Signed Message:\n" + len(digest) + digest
+	// When wallets sign with { message: { raw: digest } }, they add this prefix
+	// where digest is a 32-byte hash, so the length is 32
+	prefixedMsg := []byte(fmt.Sprintf("\x19Ethereum Signed Message:\n%d", len(digest)))
+	prefixedMsg = append(prefixedMsg, digest...)
 	prefixedHash := ethCrypto.Keccak256Hash(prefixedMsg)
 
-	prefixedPubkey, prefixedErr := ethCrypto.Ecrecover(prefixedHash.Bytes(), sig)
-	var prefixedAddress ethCommon.Address
-	if prefixedErr == nil {
-		prefixedAddress = ethCommon.BytesToAddress(ethCrypto.Keccak256(prefixedPubkey[1:])[12:])
+	pubkey, err := ethCrypto.Ecrecover(prefixedHash.Bytes(), sig)
+	if err == nil {
+		address := ethCommon.BytesToAddress(ethCrypto.Keccak256(pubkey[1:])[12:])
+		return address, nil
 	}
 
-	// If only raw succeeded, use raw
-	if rawErr == nil && prefixedErr != nil {
-		return rawAddress, nil
+	// 2. Fallback to raw signature (for CLI/SDK clients that sign without prefix)
+	pubkey, err = ethCrypto.Ecrecover(digest, sig)
+	if err != nil {
+		return ethCommon.Address{}, fmt.Errorf("failed to recover public key from both prefixed and raw signatures")
 	}
 
-	// If only prefixed succeeded, use prefixed
-	if rawErr != nil && prefixedErr == nil {
-		return prefixedAddress, nil
-	}
-
-	// If both succeeded but give the same address, return it
-	if rawErr == nil && prefixedErr == nil && rawAddress == prefixedAddress {
-		return rawAddress, nil
-	}
-
-	// If both succeeded but give different addresses, this is ambiguous
-	// The signature matches multiple possible signers depending on how it was created
-	// For now, prefer raw for backward compatibility, but log a warning
-	if rawErr == nil && prefixedErr == nil && rawAddress != prefixedAddress {
-		return rawAddress, fmt.Errorf("ambiguous signature: raw recovery=%s, prefixed recovery=%s", rawAddress.Hex(), prefixedAddress.Hex())
-	}
-
-	return ethCommon.Address{}, errors.New("signature invalid: recovery failed for both raw and prefixed message")
+	address := ethCommon.BytesToAddress(ethCrypto.Keccak256(pubkey[1:])[12:])
+	return address, nil
 }
 
 type (
