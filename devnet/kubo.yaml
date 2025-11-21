@@ -92,8 +92,9 @@ spec:
 
               # Add JSON data to IPFS and capture CID
               echo "Adding ccq-rate-limits.json to IPFS..."
-              # Use cat to pipe content directly, avoiding directory structure
-              CID=$(cat /data-to-add/ccq-rate-limits.json | ipfs add -Q)
+              # Use --raw-leaves so the CID is based on raw SHA-256 of the file content
+              # This allows deploy scripts to compute the hash with simple shasum -a 256
+              CID=$(cat /data-to-add/ccq-rate-limits.json | ipfs add -Q --raw-leaves)
               echo "=========================================="
               echo "CCQ Rate Limits CID: $CID"
               echo "=========================================="

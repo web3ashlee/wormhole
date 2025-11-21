@@ -65,8 +65,8 @@ contract DeployTestToken is Script {
         );
         console.log("Token deployed at: ", address(token));
 
-        // mint 1000 units
-        token.mint(accounts[0], 1_000_000_000_000_000_000_000);
+        // mint 1,000,000 units
+        token.mint(accounts[0], 1_000_000_000_000_000_000_000_000);
 
         ERC721PresetMinterPauserAutoId nft = new ERC721PresetMinterPauserAutoId(
             unicode"Not an APE🐒",
