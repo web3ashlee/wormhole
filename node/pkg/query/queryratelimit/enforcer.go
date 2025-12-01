@@ -59,16 +59,20 @@ func (e *Enforcer) EnforcePolicy(ctx context.Context, policy *Policy, action *Ac
 			continue
 		}
 		fullKey := strconv.Itoa(int(queryType)) + ":" + action.Key.String()
-		thisSecond, err := e.secondLimits.IncrKey(ctx, fullKey, amount, action.Time)
-		if err != nil {
-			// on failure to contact the rate limiter, we just error
-			return nil, err
+		// Check per-second limit (skip if MaxPerSecond is 0, meaning no QPS limit)
+		if limitForQueryType.MaxPerSecond > 0 {
+			thisSecond, err := e.secondLimits.IncrKey(ctx, fullKey, amount, action.Time)
+			if err != nil {
+				// on failure to contact the rate limiter, we just error
+				return nil, err
+			}
+			if thisSecond > limitForQueryType.MaxPerSecond {
+				out.Allowed = false
+				out.ExceededTypes = append(out.ExceededTypes, queryType)
+				continue
+			}
 		}
-		if thisSecond > limitForQueryType.MaxPerSecond {
-			out.Allowed = false
-			out.ExceededTypes = append(out.ExceededTypes, queryType)
-			continue
-		}
+		// Check per-minute limit
 		thisMinute, err := e.minuteLimits.IncrKey(ctx, fullKey, amount, action.Time)
 		if err != nil {
 			// on failure to contact the rate limiter, we just error

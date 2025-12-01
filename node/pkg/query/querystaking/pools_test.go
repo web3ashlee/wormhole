@@ -146,7 +146,8 @@ func TestCalculateRates(t *testing.T) {
 			if err != nil {
 				tranches = []ConversionTranche{}
 			}
-			got := CalculateRates(tt.stake, tranches)
+			// Use decimals=0 so stake values are treated as token units (no conversion)
+			got := CalculateRates(tt.stake, tranches, 0)
 
 			if got.MaxPerSecond != tt.want.MaxPerSecond {
 				t.Errorf("CalculateRates() MaxPerSecond = %d, want %d", got.MaxPerSecond, tt.want.MaxPerSecond)
@@ -198,7 +199,8 @@ func TestCalculateRates_IntegerDivision(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ParseConversionTranches() error = %v", err)
 			}
-			got := CalculateRates(stake, tranches)
+			// Use decimals=0 so stake values are treated as token units (no conversion)
+			got := CalculateRates(stake, tranches, 0)
 
 			if got.MaxPerMinute != tt.wantQPM {
 				t.Errorf("CalculateRates() QPM = %d, want %d", got.MaxPerMinute, tt.wantQPM)

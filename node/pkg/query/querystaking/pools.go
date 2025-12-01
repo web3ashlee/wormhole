@@ -291,6 +291,45 @@ func (sc *StakingClient) IsBlocklisted(ctx context.Context, poolAddress, userAdd
 	return isBlocked, nil
 }
 
+// GetTokenDecimals fetches the decimals of the pool's staking token
+func (sc *StakingClient) GetTokenDecimals(ctx context.Context, poolAddress common.Address, poolName string) (uint8, error) {
+	// Get STAKING_TOKEN address from the pool
+	tokenResult, err := sc.client.CallContract(ctx, ethereum.CallMsg{
+		To:   &poolAddress,
+		Data: PackStakingTokenCall(),
+	}, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get STAKING_TOKEN from pool %s: %w", poolName, err)
+	}
+
+	tokenAddress, err := ParseAddressResult(tokenResult)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse STAKING_TOKEN address from pool %s: %w", poolName, err)
+	}
+
+	// Get decimals from the token contract
+	decimalsResult, err := sc.client.CallContract(ctx, ethereum.CallMsg{
+		To:   &tokenAddress,
+		Data: PackDecimalsCall(),
+	}, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get decimals from token %s: %w", tokenAddress.Hex(), err)
+	}
+
+	decimals, err := ParseUint8Result(decimalsResult)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse decimals from token %s: %w", tokenAddress.Hex(), err)
+	}
+
+	sc.logger.Debug("fetched token decimals",
+		zap.String("pool", poolName),
+		zap.String("poolAddress", poolAddress.Hex()),
+		zap.String("tokenAddress", tokenAddress.Hex()),
+		zap.Uint8("decimals", decimals))
+
+	return decimals, nil
+}
+
 // DiscoverPoolFromFactory queries the factory contract to find the pool address for a query type
 func (sc *StakingClient) DiscoverPoolFromFactory(ctx context.Context, factoryAddress common.Address, queryType [32]byte) (common.Address, error) {
 	if factoryAddress == (common.Address{}) {
@@ -445,7 +484,8 @@ func (sc *StakingClient) GetConversionTableHistory(ctx context.Context, poolAddr
 // CalculateRates calculates rate limits based on stake amount and conversion tranches.
 // The tranches define rate/tranche pairs locked in at stake time.
 // Rates in the tranches are queries per minute (QPM).
-func CalculateRates(stakeAmount *uint256.Int, tranches []ConversionTranche) queryratelimit.Rule {
+// The decimals parameter is used to convert the stake amount from wei to token units.
+func CalculateRates(stakeAmount *uint256.Int, tranches []ConversionTranche, decimals uint8) queryratelimit.Rule {
 	if stakeAmount == nil || stakeAmount.Cmp(uint256.NewInt(0)) == 0 {
 		return queryratelimit.Rule{MaxPerSecond: 0, MaxPerMinute: 0}
 	}
@@ -454,10 +494,16 @@ func CalculateRates(stakeAmount *uint256.Int, tranches []ConversionTranche) quer
 		return queryratelimit.Rule{MaxPerSecond: 0, MaxPerMinute: 0}
 	}
 
+	// Convert stake amount from wei to token units using decimals
+	// This allows the JSON config to use human-readable token amounts (e.g., 5000 tokens)
+	// instead of wei amounts (e.g., 5000000000000000000000)
+	divisor := new(uint256.Int).Exp(uint256.NewInt(10), uint256.NewInt(uint64(decimals)))
+	normalizedStake := new(uint256.Int).Div(stakeAmount, divisor)
+	stakeAmountUint64 := normalizedStake.Uint64()
+
 	// Find the highest tranche that the stake qualifies for
 	// Tranches are expected to be in ascending order by stake amount
 	var selectedTranche *ConversionTranche
-	stakeAmountUint64 := stakeAmount.Uint64()
 
 	for i := range tranches {
 		if stakeAmountUint64 >= tranches[i].Tranche {
@@ -693,8 +739,26 @@ func (sc *StakingClient) FetchStakingPolicy(ctx context.Context, stakerAddr, sig
 			continue
 		}
 
+		// Fetch token decimals for proper stake amount conversion
+		decimals, err := sc.GetTokenDecimals(ctx, poolAddress, poolName)
+		if err != nil {
+			sc.logger.Warn("failed to get token decimals, defaulting to 18",
+				zap.String("poolName", poolName),
+				zap.String("poolAddress", poolAddress.Hex()),
+				zap.Error(err))
+			decimals = 18 // Default to 18 decimals (standard ERC20)
+		}
+
 		// Calculate rate limits using tranches
-		rates := CalculateRates(stakeInfo.Amount, tranches)
+		rates := CalculateRates(stakeInfo.Amount, tranches, decimals)
+
+		sc.logger.Info("rate calculation details",
+			zap.String("pool", poolName),
+			zap.String("stakeAmount", stakeInfo.Amount.String()),
+			zap.Uint8("decimals", decimals),
+			zap.Int("trancheCount", len(tranches)),
+			zap.Int("maxPerSecond", rates.MaxPerSecond),
+			zap.Int("maxPerMinute", rates.MaxPerMinute))
 
 		// Determine tier for metrics
 		tier := "none"

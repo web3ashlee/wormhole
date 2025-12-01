@@ -154,6 +154,34 @@ func ParseUint256Result(data []byte) (*uint256.Int, error) {
 	return uint256.NewInt(0).SetBytes(data), nil
 }
 
+// PackStakingTokenCall creates call data for the STAKING_TOKEN() function.
+func PackStakingTokenCall() []byte {
+	selector := crypto.Keccak256([]byte("STAKING_TOKEN()"))[:4]
+	return selector
+}
+
+// PackDecimalsCall creates call data for the decimals() function on an ERC20 token.
+func PackDecimalsCall() []byte {
+	selector := crypto.Keccak256([]byte("decimals()"))[:4]
+	return selector
+}
+
+// ParseAddressResult parses an address result from a contract call.
+func ParseAddressResult(data []byte) (common.Address, error) {
+	if len(data) != 32 {
+		return common.Address{}, fmt.Errorf("invalid address data length: got %d want 32", len(data))
+	}
+	return common.BytesToAddress(data[12:32]), nil
+}
+
+// ParseUint8Result parses a uint8 result from a contract call.
+func ParseUint8Result(data []byte) (uint8, error) {
+	if len(data) != 32 {
+		return 0, fmt.Errorf("invalid uint8 data length: got %d want 32", len(data))
+	}
+	return uint8(data[31]), nil
+}
+
 // ConversionTranche represents a single tranche in the conversion table
 type ConversionTranche struct {
 	Rate    uint64 // Queries per minute for this tranche
