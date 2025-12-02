@@ -119,14 +119,27 @@ func GetChainName(qt QueryType) (string, error) {
 	return chainName, nil
 }
 
+// PoolMetadata holds immutable pool data that can be safely cached.
+// These values are set at pool deployment and never change.
+type PoolMetadata struct {
+	StakingTokenAddress common.Address
+	TokenDecimals       uint8
+}
+
 // StakingClient wraps ethereum client for staking contract interactions
 type StakingClient struct {
-	client                 *ethclient.Client
-	logger                 *zap.Logger
-	factoryAddress         common.Address
-	ipfsClient             *IPFSClient
-	conversionHistoryCache map[common.Address][][32]byte // Pool -> CID array
-	conversionHistoryMutex sync.RWMutex                  // Protects cache
+	client         *ethclient.Client
+	logger         *zap.Logger
+	factoryAddress common.Address
+	ipfsClient     *IPFSClient
+
+	// Single mutex protects all caches (accessed sequentially in FetchStakingPolicy)
+	cacheMutex sync.RWMutex
+
+	// Caches for immutable contract data
+	conversionHistoryCache map[common.Address][][32]byte   // Pool -> CID array
+	poolMetadataCache      map[common.Address]*PoolMetadata // Pool -> token metadata
+	factoryPoolCache       map[[32]byte]common.Address      // QueryTypeBits -> pool address
 }
 
 // NewStakingClient creates a new staking client
@@ -137,6 +150,8 @@ func NewStakingClient(client *ethclient.Client, logger *zap.Logger, factoryAddre
 		factoryAddress:         factoryAddress,
 		ipfsClient:             ipfsClient,
 		conversionHistoryCache: make(map[common.Address][][32]byte),
+		poolMetadataCache:      make(map[common.Address]*PoolMetadata),
+		factoryPoolCache:       make(map[[32]byte]common.Address),
 	}
 }
 
@@ -291,20 +306,47 @@ func (sc *StakingClient) IsBlocklisted(ctx context.Context, poolAddress, userAdd
 	return isBlocked, nil
 }
 
-// GetTokenDecimals fetches the decimals of the pool's staking token
-func (sc *StakingClient) GetTokenDecimals(ctx context.Context, poolAddress common.Address, poolName string) (uint8, error) {
+// GetPoolMetadata fetches and caches immutable pool metadata (staking token address and decimals).
+// This eliminates repeated contract calls for data that never changes.
+func (sc *StakingClient) GetPoolMetadata(ctx context.Context, poolAddress common.Address, poolName string) (*PoolMetadata, error) {
+	// Check cache first (with read lock)
+	sc.cacheMutex.RLock()
+	cached, exists := sc.poolMetadataCache[poolAddress]
+	sc.cacheMutex.RUnlock()
+
+	if exists {
+		sc.logger.Debug("using cached pool metadata",
+			zap.String("pool", poolName),
+			zap.String("poolAddress", poolAddress.Hex()),
+			zap.Uint8("decimals", cached.TokenDecimals))
+		return cached, nil
+	}
+
+	// Not in cache, acquire write lock and fetch
+	sc.cacheMutex.Lock()
+	defer sc.cacheMutex.Unlock()
+
+	// Double-check cache in case another goroutine filled it while we waited
+	if cached, exists := sc.poolMetadataCache[poolAddress]; exists {
+		return cached, nil
+	}
+
+	sc.logger.Debug("fetching pool metadata from contract",
+		zap.String("pool", poolName),
+		zap.String("poolAddress", poolAddress.Hex()))
+
 	// Get STAKING_TOKEN address from the pool
 	tokenResult, err := sc.client.CallContract(ctx, ethereum.CallMsg{
 		To:   &poolAddress,
 		Data: PackStakingTokenCall(),
 	}, nil)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get STAKING_TOKEN from pool %s: %w", poolName, err)
+		return nil, fmt.Errorf("failed to get STAKING_TOKEN from pool %s: %w", poolName, err)
 	}
 
 	tokenAddress, err := ParseAddressResult(tokenResult)
 	if err != nil {
-		return 0, fmt.Errorf("failed to parse STAKING_TOKEN address from pool %s: %w", poolName, err)
+		return nil, fmt.Errorf("failed to parse STAKING_TOKEN address from pool %s: %w", poolName, err)
 	}
 
 	// Get decimals from the token contract
@@ -313,21 +355,28 @@ func (sc *StakingClient) GetTokenDecimals(ctx context.Context, poolAddress commo
 		Data: PackDecimalsCall(),
 	}, nil)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get decimals from token %s: %w", tokenAddress.Hex(), err)
+		return nil, fmt.Errorf("failed to get decimals from token %s: %w", tokenAddress.Hex(), err)
 	}
 
 	decimals, err := ParseUint8Result(decimalsResult)
 	if err != nil {
-		return 0, fmt.Errorf("failed to parse decimals from token %s: %w", tokenAddress.Hex(), err)
+		return nil, fmt.Errorf("failed to parse decimals from token %s: %w", tokenAddress.Hex(), err)
 	}
 
-	sc.logger.Debug("fetched token decimals",
+	// Store in cache
+	metadata := &PoolMetadata{
+		StakingTokenAddress: tokenAddress,
+		TokenDecimals:       decimals,
+	}
+	sc.poolMetadataCache[poolAddress] = metadata
+
+	sc.logger.Info("cached pool metadata",
 		zap.String("pool", poolName),
 		zap.String("poolAddress", poolAddress.Hex()),
 		zap.String("tokenAddress", tokenAddress.Hex()),
 		zap.Uint8("decimals", decimals))
 
-	return decimals, nil
+	return metadata, nil
 }
 
 // DiscoverPoolFromFactory queries the factory contract to find the pool address for a query type
@@ -357,6 +406,52 @@ func (sc *StakingClient) DiscoverPoolFromFactory(ctx context.Context, factoryAdd
 			zap.String("queryType", fmt.Sprintf("%x", queryType)),
 			zap.Error(err))
 		return common.Address{}, fmt.Errorf("failed to parse pool address from factory: %w", err)
+	}
+
+	return poolAddress, nil
+}
+
+// GetCachedPoolAddress fetches and caches pool addresses from the factory contract.
+// Pool addresses for a given query type are immutable once deployed.
+func (sc *StakingClient) GetCachedPoolAddress(ctx context.Context, queryTypeBits [32]byte, poolName string) (common.Address, error) {
+	// Check cache first (with read lock)
+	sc.cacheMutex.RLock()
+	cached, exists := sc.factoryPoolCache[queryTypeBits]
+	sc.cacheMutex.RUnlock()
+
+	if exists {
+		sc.logger.Debug("using cached pool address",
+			zap.String("pool", poolName),
+			zap.String("poolAddress", cached.Hex()))
+		return cached, nil
+	}
+
+	// Not in cache, acquire write lock and fetch
+	sc.cacheMutex.Lock()
+	defer sc.cacheMutex.Unlock()
+
+	// Double-check cache in case another goroutine filled it while we waited
+	if cached, exists := sc.factoryPoolCache[queryTypeBits]; exists {
+		return cached, nil
+	}
+
+	sc.logger.Debug("fetching pool address from factory",
+		zap.String("pool", poolName),
+		zap.String("queryTypeBits", fmt.Sprintf("%x", queryTypeBits)))
+
+	// Use existing method to discover pool
+	poolAddress, err := sc.DiscoverPoolFromFactory(ctx, sc.factoryAddress, queryTypeBits)
+	if err != nil {
+		return common.Address{}, err
+	}
+
+	// Store in cache (even zero address - means no pool exists for this query type)
+	sc.factoryPoolCache[queryTypeBits] = poolAddress
+
+	if poolAddress != (common.Address{}) {
+		sc.logger.Info("cached pool address",
+			zap.String("pool", poolName),
+			zap.String("poolAddress", poolAddress.Hex()))
 	}
 
 	return poolAddress, nil
@@ -396,9 +491,9 @@ func (sc *StakingClient) GetConversionTableEntry(ctx context.Context, poolAddres
 // The cache is populated lazily on first access and is thread-safe.
 func (sc *StakingClient) GetConversionTableHistory(ctx context.Context, poolAddress common.Address, poolName string) ([][32]byte, error) {
 	// Check cache first (with read lock)
-	sc.conversionHistoryMutex.RLock()
+	sc.cacheMutex.RLock()
 	cached, exists := sc.conversionHistoryCache[poolAddress]
-	sc.conversionHistoryMutex.RUnlock()
+	sc.cacheMutex.RUnlock()
 
 	if exists {
 		sc.logger.Debug("using cached conversion table history",
@@ -409,8 +504,8 @@ func (sc *StakingClient) GetConversionTableHistory(ctx context.Context, poolAddr
 	}
 
 	// Not in cache, acquire write lock and fetch
-	sc.conversionHistoryMutex.Lock()
-	defer sc.conversionHistoryMutex.Unlock()
+	sc.cacheMutex.Lock()
+	defer sc.cacheMutex.Unlock()
 
 	// Double-check cache in case another goroutine filled it while we waited
 	if cached, exists := sc.conversionHistoryCache[poolAddress]; exists {
@@ -561,8 +656,8 @@ func (sc *StakingClient) FetchStakingPolicy(ctx context.Context, stakerAddr, sig
 	for poolName, pool := range SupportedQueryPools {
 		poolsChecked++
 
-		// Discover pool address from factory using query type bits
-		poolAddress, err := sc.DiscoverPoolFromFactory(ctx, sc.factoryAddress, pool.QueryTypeBits())
+		// Discover pool address from factory using query type bits (cached)
+		poolAddress, err := sc.GetCachedPoolAddress(ctx, pool.QueryTypeBits(), poolName)
 		if err != nil {
 			totalErrors++
 			stakingPolicyFetches.WithLabelValues("factory_error", poolName).Inc()
@@ -739,14 +834,16 @@ func (sc *StakingClient) FetchStakingPolicy(ctx context.Context, stakerAddr, sig
 			continue
 		}
 
-		// Fetch token decimals for proper stake amount conversion
-		decimals, err := sc.GetTokenDecimals(ctx, poolAddress, poolName)
+		// Fetch pool metadata for proper stake amount conversion (cached)
+		poolMetadata, err := sc.GetPoolMetadata(ctx, poolAddress, poolName)
+		var decimals uint8 = 18 // Default to 18 decimals (standard ERC20)
 		if err != nil {
-			sc.logger.Warn("failed to get token decimals, defaulting to 18",
+			sc.logger.Warn("failed to get pool metadata, defaulting to 18 decimals",
 				zap.String("poolName", poolName),
 				zap.String("poolAddress", poolAddress.Hex()),
 				zap.Error(err))
-			decimals = 18 // Default to 18 decimals (standard ERC20)
+		} else {
+			decimals = poolMetadata.TokenDecimals
 		}
 
 		// Calculate rate limits using tranches
